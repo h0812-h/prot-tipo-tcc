@@ -9,12 +9,213 @@ if (isset($_SESSION['usuario_id'])) {
     exit();
 }
 
+$mensagem = '';
+$tipo_mensagem = '';
+
+// Processar cadastro de aluno
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['acao']) && $_POST['acao'] === 'cadastrar_aluno') {
+    $db = null;
+    $transacao_ativa = false;
+    
+    try {
+        $db = getDB();
+        
+        // Validar dados
+        $nome = trim($_POST['nome'] ?? '');
+        $email = trim($_POST['email'] ?? '');
+        $telefone = trim($_POST['telefone'] ?? '');
+        $data_nascimento = $_POST['data_nascimento'] ?? '';
+        $endereco = trim($_POST['endereco'] ?? '');
+        $responsavel_nome = trim($_POST['responsavel_nome'] ?? '');
+        $responsavel_telefone = trim($_POST['responsavel_telefone'] ?? '');
+        $instrumento_id = $_POST['instrumento_id'] ?? '';
+        $nivel = $_POST['nivel'] ?? '';
+        $observacoes = trim($_POST['observacoes'] ?? '');
+        
+        // Dados de pagamento (apenas para demonstração)
+        $plano_pagamento = $_POST['plano_pagamento'] ?? 'mensal';
+        $forma_pagamento = $_POST['forma_pagamento'] ?? 'cartao';
+        
+        if (empty($nome) || empty($email) || empty($telefone) || empty($instrumento_id)) {
+            throw new Exception('Por favor, preencha todos os campos obrigatórios.');
+        }
+        
+        // Verificar se email já existe
+        $stmt = $db->prepare("SELECT id FROM alunos WHERE email = ?");
+        $stmt->execute([$email]);
+        if ($stmt->fetch()) {
+            throw new Exception('Este email já está cadastrado em nosso sistema.');
+        }
+        
+        // Iniciar transação APENAS AQUI
+        $db->beginTransaction();
+        $transacao_ativa = true;
+        
+        // Inserir aluno
+        $stmt = $db->prepare("
+            INSERT INTO alunos (
+                nome, email, telefone, data_nascimento, endereco, 
+                responsavel_nome, responsavel_telefone, status, 
+                data_matricula, observacoes, status_pagamento,
+                plano_pagamento, forma_pagamento_preferida
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Pré-Matricula', NOW(), ?, 'Pendente', ?, ?)
+        ");
+        
+        $stmt->execute([
+            $nome, $email, $telefone, $data_nascimento, $endereco,
+            $responsavel_nome, $responsavel_telefone, $observacoes,
+            $plano_pagamento, $forma_pagamento
+        ]);
+        
+        $aluno_id = $db->lastInsertId();
+        
+        // Criar usuário para o aluno - CORRIGIDO
+        $username = strtolower(str_replace(' ', '.', $nome));
+        $username = preg_replace('/[^a-z0-9.]/', '', $username);
+
+        // Verificar se username já existe e adicionar número se necessário
+        $stmt = $db->prepare("SELECT id FROM usuarios WHERE username = ?");
+        $stmt->execute([$username]);
+        $counter = 1;
+        $original_username = $username;
+        while ($stmt->fetch()) {
+            $username = $original_username . $counter;
+            $stmt->execute([$username]);
+            $counter++;
+        }
+
+        // NOVO: Verificar e limpar email duplicado antes de inserir
+        try {
+            $stmt = $db->prepare("DELETE FROM usuarios WHERE email = ? AND tipo = 'aluno'");
+            $stmt->execute([$email]);
+        } catch (Exception $e) {
+            // Ignorar erro se não conseguir limpar
+        }
+
+        $senha_temporaria = 'temp' . rand(1000, 9999);
+        $senha_hash = password_hash($senha_temporaria, PASSWORD_DEFAULT);
+
+        $stmt = $db->prepare("
+            INSERT INTO usuarios (username, password, tipo, nome, email, ativo) 
+            VALUES (?, ?, 'aluno', ?, ?, 1)
+        ");
+        $stmt->execute([$username, $senha_hash, $nome, $email]);
+        
+        $usuario_id = $db->lastInsertId();
+        
+        // Atualizar aluno com usuario_id
+        $stmt = $db->prepare("UPDATE alunos SET usuario_id = ? WHERE id = ?");
+        $stmt->execute([$usuario_id, $aluno_id]);
+        
+        // Verificar se tabela pagamentos_pendentes existe
+        try {
+            $stmt = $db->prepare("
+                INSERT INTO pagamentos_pendentes (
+                    aluno_id, valor, descricao, data_vencimento, 
+                    plano_pagamento, forma_pagamento, status
+                ) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 7 DAY), ?, ?, 'Aguardando')
+            ");
+            
+            $valor_matricula = match($plano_pagamento) {
+                'mensal' => 150.00,
+                'trimestral' => 400.00,
+                'semestral' => 750.00,
+                'anual' => 1400.00,
+                default => 150.00
+            };
+            
+            $stmt->execute([
+                $aluno_id, 
+                $valor_matricula, 
+                "Taxa de matrícula - Plano $plano_pagamento", 
+                $plano_pagamento, 
+                $forma_pagamento
+            ]);
+        } catch (PDOException $e) {
+            // Se a tabela não existir, apenas continuar
+            error_log("Tabela pagamentos_pendentes não existe: " . $e->getMessage());
+        }
+        
+        // Commit da transação
+        $db->commit();
+        $transacao_ativa = false;
+        
+        // Preparar mensagem de sucesso inicial
+        $mensagem = "
+            <strong>Cadastro realizado com sucesso!</strong><br>
+            <strong>Usuário:</strong> $username<br>
+            <strong>Senha temporária:</strong> $senha_temporaria<br>
+            <strong>Valor da matrícula:</strong> R$ " . number_format($valor_matricula, 2, ',', '.') . "<br>
+            <em>Você receberá instruções de pagamento por email em breve.</em>
+        ";
+        
+        // ENVIAR EMAIL DE BOAS-VINDAS AUTOMATICAMENTE
+        try {
+            require_once 'config/email.php';
+            
+            $emailService = enviarEmail();
+            
+            // Buscar nome do instrumento
+            $stmt = $db->prepare("SELECT nome FROM instrumentos WHERE id = ?");
+            $stmt->execute([$instrumento_id]);
+            $instrumento_result = $stmt->fetch();
+            $instrumento_nome = $instrumento_result ? $instrumento_result['nome'] : 'A definir';
+            
+            $dados_aluno = [
+                'id' => $aluno_id,
+                'nome' => $nome,
+                'email' => $email,
+                'instrumento' => $instrumento_nome,
+                'plano_pagamento' => $plano_pagamento,
+                'valor_matricula' => $valor_matricula,
+                'data_vencimento' => date('d/m/Y', strtotime('+7 days'))
+            ];
+            
+            $credenciais = [
+                'username' => $username,
+                'senha_temporaria' => $senha_temporaria
+            ];
+            
+            // Tentar enviar email
+            $email_enviado = $emailService->enviarBoasVindas($dados_aluno, $credenciais);
+            
+            if ($email_enviado) {
+                $mensagem .= "<br><br>📧 <strong>Email de boas-vindas enviado com sucesso!</strong><br>";
+                $mensagem .= "<small>Verifique sua caixa de entrada (e spam) para ver as orientações completas.</small>";
+            } else {
+                $mensagem .= "<br><br>⚠️ <strong>Atenção:</strong> Não foi possível enviar o email de boas-vindas automaticamente.<br>";
+                $mensagem .= "<small>Mas não se preocupe! Seu cadastro foi realizado com sucesso. Entre em contato conosco se precisar das orientações.</small>";
+            }
+            
+        } catch (Exception $email_error) {
+            // Se der erro no email, não afetar o cadastro
+            error_log("Erro ao enviar email de boas-vindas: " . $email_error->getMessage());
+            $mensagem .= "<br><br>⚠️ <strong>Observação:</strong> Seu cadastro foi realizado com sucesso, mas houve um problema no envio do email de boas-vindas.<br>";
+            $mensagem .= "<small>Nossa equipe entrará em contato em breve com todas as orientações.</small>";
+        }
+        
+        $tipo_mensagem = 'success';
+        
+    } catch (Exception $e) {
+        // Fazer rollback APENAS se a transação estiver ativa
+        if ($transacao_ativa && $db) {
+            try {
+                $db->rollBack();
+            } catch (PDOException $rollback_error) {
+                error_log("Erro no rollback: " . $rollback_error->getMessage());
+            }
+        }
+        $mensagem = $e->getMessage();
+        $tipo_mensagem = 'error';
+    }
+}
+
 // Buscar algumas estatísticas públicas para mostrar na página inicial
 try {
     $db = getDB();
     
     // Total de alunos ativos
-    $stmt = $db->query("SELECT COUNT(*) as total FROM alunos WHERE status != 'Inativo'");
+    $stmt = $db->query("SELECT COUNT(*) as total FROM alunos WHERE status NOT IN ('Inativo', 'Cancelado')");
     $total_alunos = $stmt->fetch()['total'];
     
     // Total de turmas ativas
@@ -44,7 +245,7 @@ try {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Escola de Música Harmonia - Sistema de Gestão</title>
-    <link rel="stylesheet" href="assets/style.css">
+    <link rel="stylesheet" href="assets/css/style.css">
     <style>
         /* Estilos específicos para a página inicial */
         .hero-section {
@@ -110,7 +311,7 @@ try {
         }
         
         .btn-hero-primary {
-            background: rgb(18, 54, 153);
+            background: white;
             color: var(--primary-color);
             font-weight: 600;
         }
@@ -120,6 +321,12 @@ try {
             color: white;
             border: 2px solid white;
             backdrop-filter: blur(10px);
+        }
+        
+        .btn-hero-register {
+            background: #ff6b35;
+            color: white;
+            font-weight: 600;
         }
         
         .features-section {
@@ -186,6 +393,212 @@ try {
         .feature-description {
             color: var(--text-secondary);
             line-height: 1.6;
+        }
+        
+        /* Seção de Cadastro */
+        .registration-section {
+            padding: 80px 0;
+            background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+        }
+        
+        .registration-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        
+        .registration-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 40px;
+            margin-top: 40px;
+        }
+        
+        .registration-form-card {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+        }
+        
+        .payment-preview-card {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+            border: 2px solid #e9ecef;
+        }
+        
+        .form-section {
+            margin-bottom: 30px;
+        }
+        
+        .form-section-title {
+            font-size: 1.3em;
+            color: var(--text-primary);
+            margin-bottom: 20px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+        
+        .form-group-full {
+            grid-column: 1 / -1;
+        }
+        
+        .payment-plans {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .payment-plan {
+            border: 2px solid #e9ecef;
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+        
+        .payment-plan:hover {
+            border-color: var(--primary-color);
+            transform: translateY(-2px);
+        }
+        
+        .payment-plan.selected {
+            border-color: var(--primary-color);
+            background: rgba(102, 126, 234, 0.1);
+        }
+        
+        .payment-plan input[type="radio"] {
+            position: absolute;
+            opacity: 0;
+        }
+        
+        .plan-name {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 5px;
+        }
+        
+        .plan-price {
+            font-size: 1.5em;
+            font-weight: 700;
+            color: var(--primary-color);
+            margin-bottom: 5px;
+        }
+        
+        .plan-description {
+            font-size: 0.9em;
+            color: var(--text-muted);
+        }
+        
+        .payment-methods {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .payment-method {
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+        
+        .payment-method:hover {
+            border-color: var(--primary-color);
+        }
+        
+        .payment-method.selected {
+            border-color: var(--primary-color);
+            background: rgba(102, 126, 234, 0.1);
+        }
+        
+        .payment-method input[type="radio"] {
+            position: absolute;
+            opacity: 0;
+        }
+        
+        .payment-icon {
+            font-size: 1.5em;
+            margin-bottom: 5px;
+            display: block;
+        }
+        
+        .payment-name {
+            font-size: 0.9em;
+            font-weight: 600;
+        }
+        
+        .payment-summary {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .summary-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        
+        .summary-total {
+            border-top: 2px solid #dee2e6;
+            padding-top: 15px;
+            margin-top: 15px;
+            font-weight: 700;
+            font-size: 1.2em;
+        }
+        
+        .payment-notice {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 20px;
+            text-align: center;
+        }
+        
+        .payment-notice .icon {
+            font-size: 1.5em;
+            margin-bottom: 10px;
+            display: block;
+        }
+        
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid transparent;
+        }
+        
+        .alert-success {
+            background: #d4edda;
+            border-color: #c3e6cb;
+            color: #155724;
+        }
+        
+        .alert-error {
+            background: #f8d7da;
+            border-color: #f5c6cb;
+            color: #721c24;
         }
         
         .stats-section {
@@ -378,6 +791,23 @@ try {
                 gap: 30px;
             }
             
+            .registration-grid {
+                grid-template-columns: 1fr;
+                gap: 30px;
+            }
+            
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+            
+            .payment-plans {
+                grid-template-columns: 1fr;
+            }
+            
+            .payment-methods {
+                grid-template-columns: 1fr;
+            }
+            
             .stats-grid {
                 grid-template-columns: repeat(2, 1fr);
                 gap: 20px;
@@ -404,7 +834,7 @@ try {
     <!-- Hero Section -->
     <section class="hero-section">
         <div class="hero-content">
-            <h1 class="hero-title">🎵 Escola de Música Harmonia</h1>
+            <h1 class="hero-title">🎵 Escola de Música Forjados Music Studio</h1>
             <p class="hero-subtitle">Transformando vidas através da música</p>
             <p class="hero-description">
                 Sistema completo de gestão escolar para instituições de ensino musical. 
@@ -414,9 +844,239 @@ try {
                 <a href="login.php" class="btn btn-hero-primary">
                     🚀 Acessar Sistema
                 </a>
+                <a href="#cadastro" class="btn btn-hero-register">
+                    📝 Matricule-se Agora
+                </a>
                 <a href="#features" class="btn btn-hero-secondary">
                     📖 Saiba Mais
                 </a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Registration Section -->
+    <section id="cadastro" class="registration-section">
+        <div class="registration-container">
+            <h2 class="section-title">📝 Faça sua Matrícula</h2>
+            <p class="section-subtitle">
+                Preencha seus dados e escolha seu plano de pagamento para começar suas aulas
+            </p>
+            
+            <?php if ($mensagem): ?>
+                <div class="alert alert-<?= $tipo_mensagem ?>">
+                    <?= $mensagem ?>
+                </div>
+            <?php endif; ?>
+            
+            <div class="registration-grid">
+                <!-- Formulário de Cadastro -->
+                <div class="registration-form-card">
+                    <form method="POST" action="" id="registrationForm">
+                        <input type="hidden" name="acao" value="cadastrar_aluno">
+                        
+                        <!-- Dados Pessoais -->
+                        <div class="form-section">
+                            <h3 class="form-section-title">
+                                <span>👤</span> Dados Pessoais
+                            </h3>
+                            
+                            <div class="form-group">
+                                <label for="nome">Nome Completo *</label>
+                                <input type="text" id="nome" name="nome" class="form-control" required 
+                                       value="<?= htmlspecialchars($_POST['nome'] ?? '') ?>">
+                            </div>
+                            
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="email">Email *</label>
+                                    <input type="email" id="email" name="email" class="form-control" required
+                                           value="<?= htmlspecialchars($_POST['email'] ?? '') ?>">
+                                </div>
+                                <div class="form-group">
+                                    <label for="telefone">Telefone *</label>
+                                    <input type="tel" id="telefone" name="telefone" class="form-control" required
+                                           value="<?= htmlspecialchars($_POST['telefone'] ?? '') ?>">
+                                </div>
+                            </div>
+                            
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="data_nascimento">Data de Nascimento</label>
+                                    <input type="date" id="data_nascimento" name="data_nascimento" class="form-control"
+                                           value="<?= htmlspecialchars($_POST['data_nascimento'] ?? '') ?>">
+                                </div>
+                                <div class="form-group">
+                                    <label for="instrumento_id">Instrumento Desejado *</label>
+                                    <select id="instrumento_id" name="instrumento_id" class="form-control" required>
+                                        <option value="">Selecione um instrumento</option>
+                                        <?php foreach ($instrumentos as $instrumento): ?>
+                                            <option value="<?= $instrumento['id'] ?>" 
+                                                    <?= ($_POST['instrumento_id'] ?? '') == $instrumento['id'] ? 'selected' : '' ?>>
+                                                <?= htmlspecialchars($instrumento['icone'] . ' ' . $instrumento['nome']) ?>
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="endereco">Endereço</label>
+                                <input type="text" id="endereco" name="endereco" class="form-control"
+                                       value="<?= htmlspecialchars($_POST['endereco'] ?? '') ?>">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="nivel">Nível de Experiência</label>
+                                <select id="nivel" name="nivel" class="form-control">
+                                    <option value="">Selecione seu nível</option>
+                                    <option value="Iniciante" <?= ($_POST['nivel'] ?? '') === 'Iniciante' ? 'selected' : '' ?>>Iniciante</option>
+                                    <option value="Básico" <?= ($_POST['nivel'] ?? '') === 'Básico' ? 'selected' : '' ?>>Básico</option>
+                                    <option value="Intermediário" <?= ($_POST['nivel'] ?? '') === 'Intermediário' ? 'selected' : '' ?>>Intermediário</option>
+                                    <option value="Avançado" <?= ($_POST['nivel'] ?? '') === 'Avançado' ? 'selected' : '' ?>>Avançado</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <!-- Responsável (se menor de idade) -->
+                        <div class="form-section">
+                            <h3 class="form-section-title">
+                                <span>👨‍👩‍👧‍👦</span> Responsável (se menor de idade)
+                            </h3>
+                            
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="responsavel_nome">Nome do Responsável</label>
+                                    <input type="text" id="responsavel_nome" name="responsavel_nome" class="form-control"
+                                           value="<?= htmlspecialchars($_POST['responsavel_nome'] ?? '') ?>">
+                                </div>
+                                <div class="form-group">
+                                    <label for="responsavel_telefone">Telefone do Responsável</label>
+                                    <input type="tel" id="responsavel_telefone" name="responsavel_telefone" class="form-control"
+                                           value="<?= htmlspecialchars($_POST['responsavel_telefone'] ?? '') ?>">
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Observações -->
+                        <div class="form-section">
+                            <h3 class="form-section-title">
+                                <span>📝</span> Observações
+                            </h3>
+                            
+                            <div class="form-group">
+                                <label for="observacoes">Observações Adicionais</label>
+                                <textarea id="observacoes" name="observacoes" class="form-control" rows="3" 
+                                          placeholder="Conte-nos sobre seus objetivos musicais, experiências anteriores, etc."><?= htmlspecialchars($_POST['observacoes'] ?? '') ?></textarea>
+                            </div>
+                        </div>
+                        
+                        <button type="submit" class="btn btn-primary w-full">
+                            🎯 Finalizar Matrícula
+                        </button>
+                    </form>
+                </div>
+                
+                <!-- Preview de Pagamento -->
+                <div class="payment-preview-card">
+                    <h3 class="form-section-title">
+                        <span>💳</span> Planos e Pagamento
+                    </h3>
+                    
+                    <!-- Planos de Pagamento -->
+                    <div class="form-section">
+                        <h4 style="margin-bottom: 15px; color: var(--text-secondary);">Escolha seu plano:</h4>
+                        <div class="payment-plans">
+                            <label class="payment-plan" for="mensal">
+                                <input type="radio" id="mensal" name="plano_pagamento" value="mensal" checked>
+                                <div class="plan-name">Mensal</div>
+                                <div class="plan-price">R$ 150</div>
+                                <div class="plan-description">Por mês</div>
+                            </label>
+                            
+                            <label class="payment-plan" for="trimestral">
+                                <input type="radio" id="trimestral" name="plano_pagamento" value="trimestral">
+                                <div class="plan-name">Trimestral</div>
+                                <div class="plan-price">R$ 400</div>
+                                <div class="plan-description">3 meses<br><small>Economize R$ 50</small></div>
+                            </label>
+                            
+                            <label class="payment-plan" for="semestral">
+                                <input type="radio" id="semestral" name="plano_pagamento" value="semestral">
+                                <div class="plan-name">Semestral</div>
+                                <div class="plan-price">R$ 750</div>
+                                <div class="plan-description">6 meses<br><small>Economize R$ 150</small></div>
+                            </label>
+                            
+                            <label class="payment-plan" for="anual">
+                                <input type="radio" id="anual" name="plano_pagamento" value="anual">
+                                <div class="plan-name">Anual</div>
+                                <div class="plan-price">R$ 1.400</div>
+                                <div class="plan-description">12 meses<br><small>Economize R$ 400</small></div>
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <!-- Formas de Pagamento -->
+                    <div class="form-section">
+                        <h4 style="margin-bottom: 15px; color: var(--text-secondary);">Forma de pagamento preferida:</h4>
+                        <div class="payment-methods">
+                            <label class="payment-method" for="cartao">
+                                <input type="radio" id="cartao" name="forma_pagamento" value="cartao" checked>
+                                <span class="payment-icon">💳</span>
+                                <div class="payment-name">Cartão</div>
+                            </label>
+                            
+                            <label class="payment-method" for="pix">
+                                <input type="radio" id="pix" name="forma_pagamento" value="pix">
+                                <span class="payment-icon">📱</span>
+                                <div class="payment-name">PIX</div>
+                            </label>
+                            
+                            <label class="payment-method" for="boleto">
+                                <input type="radio" id="boleto" name="forma_pagamento" value="boleto">
+                                <span class="payment-icon">🧾</span>
+                                <div class="payment-name">Boleto</div>
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <!-- Resumo do Pagamento -->
+                    <div class="payment-summary">
+                        <h4 style="margin-bottom: 15px; color: var(--text-primary);">Resumo do Pagamento</h4>
+                        
+                        <div class="summary-row">
+                            <span>Taxa de matrícula:</span>
+                            <span id="valor-matricula">R$ 150,00</span>
+                        </div>
+                        
+                        <div class="summary-row">
+                            <span>Plano selecionado:</span>
+                            <span id="plano-selecionado">Mensal</span>
+                        </div>
+                        
+                        <div class="summary-row">
+                            <span>Forma de pagamento:</span>
+                            <span id="forma-selecionada">Cartão de Crédito</span>
+                        </div>
+                        
+                        <div class="summary-row summary-total">
+                            <span>Total a pagar:</span>
+                            <span id="total-pagar">R$ 150,00</span>
+                        </div>
+                    </div>
+                    
+                    <!-- Aviso sobre Pagamento -->
+                    <div class="payment-notice">
+                        <span class="icon">⚠️</span>
+                        <strong>Importante:</strong><br>
+                        O pagamento será processado após a confirmação da matrícula. 
+                        Você receberá as instruções de pagamento por email.
+                        <br><br>
+                        <small style="color: #666;">
+                            * Esta é apenas uma demonstração visual do sistema de pagamento.
+                        </small>
+                    </div>
+                </div>
             </div>
         </div>
     </section>
@@ -560,6 +1220,7 @@ try {
             <div class="footer-links">
                 <a href="login.php">Login</a>
                 <a href="#features">Funcionalidades</a>
+                <a href="#cadastro">Matrícula</a>
                 <a href="mailto:contato@escolaharmonia.com">Contato</a>
                 <a href="tel:(11)99999-0000">Telefone</a>
             </div>
@@ -605,6 +1266,63 @@ try {
                 }, 30);
             });
         }
+
+        // Gerenciar seleção de planos de pagamento
+        document.querySelectorAll('input[name="plano_pagamento"]').forEach(radio => {
+            radio.addEventListener('change', function() {
+                // Remover seleção anterior
+                document.querySelectorAll('.payment-plan').forEach(plan => {
+                    plan.classList.remove('selected');
+                });
+                
+                // Adicionar seleção atual
+                this.closest('.payment-plan').classList.add('selected');
+                
+                // Atualizar resumo
+                const valores = {
+                    'mensal': { valor: 150, nome: 'Mensal' },
+                    'trimestral': { valor: 400, nome: 'Trimestral' },
+                    'semestral': { valor: 750, nome: 'Semestral' },
+                    'anual': { valor: 1400, nome: 'Anual' }
+                };
+                
+                const plano = valores[this.value];
+                document.getElementById('valor-matricula').textContent = `R$ ${plano.valor.toLocaleString('pt-BR', {minimumFractionDigits: 2})}`;
+                document.getElementById('plano-selecionado').textContent = plano.nome;
+                document.getElementById('total-pagar').textContent = `R$ ${plano.valor.toLocaleString('pt-BR', {minimumFractionDigits: 2})}`;
+            });
+        });
+
+        // Gerenciar seleção de formas de pagamento
+        document.querySelectorAll('input[name="forma_pagamento"]').forEach(radio => {
+            radio.addEventListener('change', function() {
+                // Remover seleção anterior
+                document.querySelectorAll('.payment-method').forEach(method => {
+                    method.classList.remove('selected');
+                });
+                
+                // Adicionar seleção atual
+                this.closest('.payment-method').classList.add('selected');
+                
+                // Atualizar resumo
+                const formas = {
+                    'cartao': 'Cartão de Crédito',
+                    'pix': 'PIX',
+                    'boleto': 'Boleto Bancário'
+                };
+                
+                document.getElementById('forma-selecionada').textContent = formas[this.value];
+            });
+        });
+
+        // Inicializar seleções padrão
+        document.addEventListener('DOMContentLoaded', function() {
+            // Selecionar plano mensal por padrão
+            document.querySelector('input[name="plano_pagamento"][value="mensal"]').closest('.payment-plan').classList.add('selected');
+            
+            // Selecionar cartão por padrão
+            document.querySelector('input[name="forma_pagamento"][value="cartao"]').closest('.payment-method').classList.add('selected');
+        });
 
         // Intersection Observer para animações
         const observerOptions = {
@@ -662,6 +1380,26 @@ try {
             card.addEventListener('mouseleave', function() {
                 this.style.transform = 'translateY(0) scale(1) rotate(0deg)';
             });
+        });
+
+        // Validação do formulário
+        document.getElementById('registrationForm').addEventListener('submit', function(e) {
+            const nome = document.getElementById('nome').value.trim();
+            const email = document.getElementById('email').value.trim();
+            const telefone = document.getElementById('telefone').value.trim();
+            const instrumento = document.getElementById('instrumento_id').value;
+            
+            if (!nome || !email || !telefone || !instrumento) {
+                e.preventDefault();
+                alert('Por favor, preencha todos os campos obrigatórios marcados com *');
+                return false;
+            }
+            
+            // Confirmar envio
+            if (!confirm('Confirma o envio da matrícula? Você receberá as instruções de pagamento por email.')) {
+                e.preventDefault();
+                return false;
+            }
         });
 
         // Preloader simples
